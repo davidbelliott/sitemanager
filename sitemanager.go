@@ -11,8 +11,8 @@ import (
 
 const (
 	sitesDir      = "sites"
-	socketBaseDir = "/var/www/run"
-	staticBaseDir = "/var/www/htdoc"
+	socketBaseDir = "/run"
+	staticBaseDir = "/htdoc"
 	httpdTemplateFilename = "httpd-template.conf"
 	httpdConfigFilepath = "/etc/httpd.conf"
 )
