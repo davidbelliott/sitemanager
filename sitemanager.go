@@ -1,102 +1,224 @@
 package main
 
 import (
-	"flag"
-	"fmt"
-	"log"
-	"os"
-	"path/filepath"
-	"text/template"
+   "flag"
+   "fmt"
+   "log"
+   "encoding/json"
+   "io/ioutil"
+   "os"
+   "path/filepath"
+   "text/template"
+   cp "github.com/otiai10/copy"
 )
 
-const (
-	sitesDir      = "sites"
-	socketBaseDir = "/run"
-	staticBaseDir = "/htdoc"
-	httpdTemplateFilename = "httpd-template.conf"
-	httpdConfigFilepath = "/etc/httpd.conf"
-)
+type SystemConfig struct {
+   socketBaseDir   string      // where should socket files for dynamic sites be placed?
+   staticBaseDir   string      // where should static files be placed?
+   servicesDir     string      // where should services be installed?
+   httpdConfigFilepath   string    // where should httpd config be placed?
+   serviceFileExtension string
+   httpdTemplateFilename   string
+   serviceTemplateFilename string
+}
 
 type SiteInfo struct {
-	Hostname        string
-	IsDynamic       bool
-	ExecutablePath  string
-	SocketPath      string
-	StaticFilesPath string
+   Hostname        string          `json:"hostname"`
+   IsDynamic       bool            `json:"is_dynamic"`
+   ExecutablePath  string          `json:"exe_path"`
+   SocketPath      string          `json:"socket_path"`
+   StaticFilesSourcePath string    `json:"static_files_src"`
+   StaticFilesInstallPath string   `json:"static_files_dst"`
 }
 
-func readAllSites(sitesDir string) ([]SiteInfo, error) {
-	// Read the provided sites directory and create a table of site information
-	// site hostname, type (static vs. dynamic), allocated port if dynamic
-	sitesInfo := []SiteInfo{}
+func readAllSites(sitesDir string, sysCfg SystemConfig) ([]SiteInfo, error) {
+   // Read the provided sites directory and create a table of site information
+   // site hostname, type (static vs. dynamic), allocated port if dynamic
+   sitesInfo := []SiteInfo{}
 
-	files, err := os.ReadDir(sitesDir)
-	if err != nil {
-		return nil, err
-	}
+   files, err := os.ReadDir(sitesDir)
+   if err != nil {
+       return nil, err
+   }
 
-	for _, file := range files {
-		siteName := file.Name()
-		buildDir := filepath.Join(sitesDir, file.Name(), "build")
-		mainExe := filepath.Join(buildDir, "main")
+   for _, file := range files {
+       siteName := file.Name()
+       buildDir := filepath.Join(sitesDir, file.Name(), "build")
+       mainExe := filepath.Join(buildDir, "main")
 
-		// Skip non-directories or files where stat fails
-		info, err := os.Stat(buildDir)
-		if err != nil {
-			log.Printf("Stat error: %s %s", file, err)
-			continue
-		}
-		if !info.Mode().IsDir() {
-			log.Printf("%s is not a directory", file)
-			continue
-		}
+       // Skip non-directories or files where stat fails
+       info, err := os.Stat(buildDir)
+       if err != nil {
+           continue
+       }
+       if !info.Mode().IsDir() {
+           continue
+       }
 
-		thisSite := SiteInfo{Hostname: siteName}
+       thisSite := SiteInfo{Hostname: siteName}
 
-		_, err = os.Stat(mainExe)
-		if err == nil {
-			thisSite.IsDynamic = true
-			thisSite.ExecutablePath = mainExe
-			thisSite.SocketPath = filepath.Join(socketBaseDir, fmt.Sprintf("%s.sock", siteName))
-		} else {
-			thisSite.IsDynamic = false
-			log.Printf("Static site detected: %s", file)
-			log.Print(err)
-			thisSite.StaticFilesPath = filepath.Join(staticBaseDir, siteName)
-		}
+       _, err = os.Stat(mainExe)
+       if err == nil {
+           thisSite.IsDynamic = true
+           thisSite.ExecutablePath = mainExe
+           thisSite.SocketPath = filepath.Join(sysCfg.socketBaseDir, fmt.Sprintf("%s.sock", siteName))
+       } else {
+           thisSite.IsDynamic = false
+           thisSite.StaticFilesSourcePath = buildDir
+           thisSite.StaticFilesInstallPath = filepath.Join(sysCfg.staticBaseDir, siteName)
+       }
 
-		// Add site info
-		sitesInfo = append(sitesInfo, thisSite)
-	}
+       // Add site info
+       sitesInfo = append(sitesInfo, thisSite)
+   }
 
-	return sitesInfo, nil
+   return sitesInfo, nil
 }
 
-func readAndPrintSitesInfo() {
-	sitesInfo, err := readAllSites(sitesDir)
-	if err != nil {
-		log.Fatal(err)
-	}
-	log.Print(sitesInfo)
+func updateSystemConfigFiles(sitesInfo []SiteInfo, templateDir string, sysCfg SystemConfig) error {
+   // Update httpd config file to route traffic to each site
+   httpdTemplate, err := template.ParseFiles(filepath.Join(templateDir, sysCfg.httpdTemplateFilename))
+   if err != nil {
+       return err
+   }
+   f, err := os.Create(sysCfg.httpdConfigFilepath)
+   if err != nil {
+       return err
+   }
+   httpdTemplate.Execute(f, sitesInfo)
 
-
-	// TODO: create or update service files for each site
-	
-
-	// Update httpd config file to route traffic to each site
-	httpdTemplate, err := template.ParseFiles(httpdTemplateFilename)
-	if err != nil {
-		log.Fatal(err)
-	}
-	f, err := os.Create(httpdConfigFilepath)
-	if err != nil {
-		log.Fatal(err)
-	}
-	httpdTemplate.Execute(f, sitesInfo)
+   // Create service file for each dynamic site and copy files for each static site
+   serviceTemplate, err := template.ParseFiles(filepath.Join(templateDir,
+       sysCfg.serviceTemplateFilename))
+   if err != nil {
+       return err
+   }
+   for _, site := range sitesInfo {
+       if site.IsDynamic {
+           f, err := os.Create(filepath.Join(sysCfg.servicesDir,
+               site.Hostname + "." + sysCfg.serviceFileExtension))
+           if err != nil {
+               return err
+           }
+           serviceTemplate.Execute(f, site)
+       } else {
+           opt := cp.Options {
+               OnDirExists: func(src, dest string) cp.DirExistsAction {
+                   return cp.Replace
+               },
+           }
+           cp.Copy(site.StaticFilesSourcePath, site.StaticFilesInstallPath, opt)
+       }
+   }
+   return nil
 }
+
+
+func sitesInfoFromJsonFile(filename string) ([]SiteInfo, error) {
+   file, err := os.Open(filename)
+   if err != nil {
+       return nil, err
+   }
+   defer file.Close()
+
+   var sitesInfo []SiteInfo
+   byteValue, _ := ioutil.ReadAll(file)
+   err = json.Unmarshal(byteValue, &sitesInfo);
+   if err != nil {
+       return nil, err
+   }
+   return sitesInfo, nil
+
+}
+
+
+func sitesInfoToJsonFile(filename string, sitesInfo []SiteInfo) error {
+   sitesJson, err := json.MarshalIndent(sitesInfo, "", "    ")
+   err = os.WriteFile(filename, sitesJson, 0644)
+   return err
+}
+
+
+func removeSystemConfigFiles(sitesInfo []SiteInfo, sysCfg SystemConfig) error {
+   // Remove httpd config file
+   err := os.Remove(sysCfg.httpdConfigFilepath)
+   if err != nil {
+       log.Print(err)
+   }
+
+   // Remove service files
+   for _, site := range sitesInfo {
+       if site.IsDynamic {
+           removeFilepath := filepath.Join(sysCfg.servicesDir,
+               site.Hostname + "." + sysCfg.serviceFileExtension)
+           err = os.Remove(removeFilepath)
+           if err != nil {
+               log.Print(err)
+           }
+       } else {
+           err = os.RemoveAll(site.StaticFilesInstallPath)
+           if err != nil {
+               log.Print(err)
+           }
+       }
+   }
+
+   return nil
+}
+
 
 func main() {
-	flag.Parse()
-	readAndPrintSitesInfo()
-}
+   flag.Parse()
 
+   ex, err := os.Executable()
+   if err != nil {
+       log.Fatal(err)
+   }
+   exPath := filepath.Dir(ex)
+
+   sitesDir     := "/sites"
+   templateDir  := filepath.Join(exPath, "templates")
+   jsonFilename := filepath.Join(exPath, "sites.json")
+
+   systemConfigUbuntuDev := SystemConfig {
+       serviceTemplateFilename: "site.service",
+       httpdTemplateFilename: "nginx.conf",
+       socketBaseDir: "/tmp/sitemgr/sock",
+       staticBaseDir: "/tmp/sitemgr/www",
+       servicesDir:   "/tmp/sitemgr/service",
+       httpdConfigFilepath: "/tmp/sitemgr/nginx.conf",
+       serviceFileExtension: "service",
+   }
+
+   sysCfg := systemConfigUbuntuDev
+
+   // Infer site info from directory structure
+   sitesInfo, err := readAllSites(sitesDir, sysCfg)
+   if err != nil {
+       log.Fatal(err)
+   }
+
+   // Remove previously-deployed managed services and static files
+   oldSitesInfo, err := sitesInfoFromJsonFile(jsonFilename)
+   if err != nil {
+       log.Printf("invalid or missing file %s; skipping removal of old files", jsonFilename)
+   } else {
+       err = removeSystemConfigFiles(oldSitesInfo, sysCfg)
+       if err != nil {
+           log.Fatal(err)
+       }
+   }
+
+   // Install new updated services, config files, and static files
+   err = updateSystemConfigFiles(sitesInfo, templateDir, sysCfg)
+   if err != nil {
+       log.Fatal(err)
+   }
+
+   // Save current sitesInfo to json so it can be used to remove stale files
+   // on next run
+   err = sitesInfoToJsonFile(jsonFilename, sitesInfo)
+   if err != nil {
+       log.Fatal(err)
+   }
+}
