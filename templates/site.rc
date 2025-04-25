@@ -1,0 +1,11 @@
+#!/bin/ksh
+
+daemon="{{.ExecutablePath}}"
+daemon_flags="--unix {{.SocketPath}}"
+daemon_user="www"
+daemon_logger="daemon.info"
+
+. /etc/rc.d/rc.subr
+rc_bg=YES
+
+rc_cmd "$1"

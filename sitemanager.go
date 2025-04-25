@@ -8,11 +8,13 @@ import (
    "io/ioutil"
    "os"
    "path/filepath"
+   "strings"
    "text/template"
    cp "github.com/otiai10/copy"
 )
 
 type SystemConfig struct {
+   httpdChrootDir  string
    socketBaseDir   string      // where should socket files for dynamic sites be placed?
    staticBaseDir   string      // where should static files be placed?
    servicesDir     string      // where should services be installed?
@@ -20,6 +22,7 @@ type SystemConfig struct {
    serviceFileExtension string
    httpdTemplateFilename   string
    serviceTemplateFilename string
+   serviceFilePermissions int
 }
 
 type SiteInfo struct {
@@ -27,8 +30,10 @@ type SiteInfo struct {
    IsDynamic       bool            `json:"is_dynamic"`
    ExecutablePath  string          `json:"exe_path"`
    SocketPath      string          `json:"socket_path"`
+   SocketPathRel   string          `json:"socket_path_rel"`
    StaticFilesSourcePath string    `json:"static_files_src"`
    StaticFilesInstallPath string   `json:"static_files_dst"`
+   StaticFilesInstallPathRel   string `json:"static_files_dst_rel"`
 }
 
 func readAllSites(sitesDir string, sysCfg SystemConfig) ([]SiteInfo, error) {
@@ -62,10 +67,19 @@ func readAllSites(sitesDir string, sysCfg SystemConfig) ([]SiteInfo, error) {
            thisSite.IsDynamic = true
            thisSite.ExecutablePath = mainExe
            thisSite.SocketPath = filepath.Join(sysCfg.socketBaseDir, fmt.Sprintf("%s.sock", siteName))
+           thisSite.SocketPathRel, err = filepath.Rel(sysCfg.httpdChrootDir, thisSite.SocketPath)
+           if err != nil {
+               return nil, err
+           }
        } else {
            thisSite.IsDynamic = false
            thisSite.StaticFilesSourcePath = buildDir
            thisSite.StaticFilesInstallPath = filepath.Join(sysCfg.staticBaseDir, siteName)
+           thisSite.StaticFilesInstallPathRel, err = filepath.Rel(
+               sysCfg.httpdChrootDir, thisSite.StaticFilesInstallPath)
+           if err != nil {
+               return nil, err
+           }
        }
 
        // Add site info
@@ -73,6 +87,15 @@ func readAllSites(sitesDir string, sysCfg SystemConfig) ([]SiteInfo, error) {
    }
 
    return sitesInfo, nil
+}
+
+
+func getServiceFilepath(hostname string, sysCfg SystemConfig) string {
+    replacer := strings.NewReplacer(".", "_", "-", "_")
+    filePath := filepath.Join(sysCfg.servicesDir,
+        replacer.Replace(hostname) +
+        sysCfg.serviceFileExtension)
+    return filePath
 }
 
 func updateSystemConfigFiles(sitesInfo []SiteInfo, templateDir string, sysCfg SystemConfig) error {
@@ -95,8 +118,10 @@ func updateSystemConfigFiles(sitesInfo []SiteInfo, templateDir string, sysCfg Sy
    }
    for _, site := range sitesInfo {
        if site.IsDynamic {
-           f, err := os.Create(filepath.Join(sysCfg.servicesDir,
-               site.Hostname + "." + sysCfg.serviceFileExtension))
+           filePath := getServiceFilepath(site.Hostname, sysCfg)
+           filePermissions := os.FileMode(sysCfg.serviceFilePermissions)
+            // Create the file with the specified permissions
+           f, err := os.OpenFile(filePath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, filePermissions)
            if err != nil {
                return err
            }
@@ -149,8 +174,7 @@ func removeSystemConfigFiles(sitesInfo []SiteInfo, sysCfg SystemConfig) error {
    // Remove service files
    for _, site := range sitesInfo {
        if site.IsDynamic {
-           removeFilepath := filepath.Join(sysCfg.servicesDir,
-               site.Hostname + "." + sysCfg.serviceFileExtension)
+           removeFilepath := getServiceFilepath(site.Hostname, sysCfg)
            err = os.Remove(removeFilepath)
            if err != nil {
                log.Print(err)
@@ -180,17 +204,31 @@ func main() {
    templateDir  := filepath.Join(exPath, "templates")
    jsonFilename := filepath.Join(exPath, "sites.json")
 
-   systemConfigUbuntuDev := SystemConfig {
+   /*systemConfigUbuntuDev := SystemConfig {
+       httpdChrootDir: "/",
        serviceTemplateFilename: "site.service",
        httpdTemplateFilename: "nginx.conf",
        socketBaseDir: "/tmp/sitemgr/sock",
        staticBaseDir: "/tmp/sitemgr/www",
        servicesDir:   "/tmp/sitemgr/service",
        httpdConfigFilepath: "/tmp/sitemgr/nginx.conf",
-       serviceFileExtension: "service",
+       serviceFileExtension: ".service",
+       serviceFilePermissions: 0660,
+   }*/
+
+   systemConfigOpenBsd := SystemConfig {
+       httpdChrootDir: "/var/www",
+       serviceTemplateFilename: "site.rc",
+       httpdTemplateFilename: "httpd.conf",
+       socketBaseDir: "/var/www/run",
+       staticBaseDir: "/var/www/htdocs",
+       servicesDir:   "/etc/rc.d/",
+       httpdConfigFilepath: "/etc/httpd.conf",
+       serviceFileExtension: "",
+       serviceFilePermissions: 0555,
    }
 
-   sysCfg := systemConfigUbuntuDev
+   sysCfg := systemConfigOpenBsd
 
    // Infer site info from directory structure
    sitesInfo, err := readAllSites(sitesDir, sysCfg)
